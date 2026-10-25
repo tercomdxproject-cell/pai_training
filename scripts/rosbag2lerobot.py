@@ -10,20 +10,26 @@ import importlib.util
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
+def decode_image_msg(msg):
+    """sensor_msgs/msg/Image を (H, W, 3) の uint8 RGB 配列にデコード"""
+    img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, -1))
+    if msg.encoding == 'bgr8':
+        img = img[:, :, ::-1]
+    elif msg.encoding == 'rgb8':
+        pass
+    return img
+
 class RosbagToLeRobot:
     def __init__(self, bag_dir, output_dir, config_path, target_freq=None):
         self.bag_path = Path(bag_dir).resolve()
         self.output_dir = Path(output_dir).resolve()
         self.target_freq = target_freq
 
-        # Find all episode directories (containing .db3 and metadata.yaml)
         self.episode_dirs = sorted(p.parent for p in self.bag_path.rglob('*.db3'))
         if not self.episode_dirs:
             raise FileNotFoundError(f"No rosbag2 episode directories found in {bag_dir}")
 
         print(f"Found {len(self.episode_dirs)} episode directories")
-        for ep_dir in self.episode_dirs:
-            print(f"  - {ep_dir}")
 
         if config_path.endswith('.py'):
             config = load_config_py(config_path)
@@ -32,7 +38,6 @@ class RosbagToLeRobot:
             repo_id = getattr(config, "repo_id", "teleop_rosbag_dataset")
             task_name = getattr(config, "task_name", "teleop")
         else:
-            # YAML fallback
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
             features = config['features']
@@ -42,7 +47,6 @@ class RosbagToLeRobot:
 
         self.task_name = task_name
 
-        # --- Dataset creation with user prompt if dir exists ---
         while True:
             try:
                 self.dataset = LeRobotDataset.create(
@@ -58,7 +62,6 @@ class RosbagToLeRobot:
                 print(f"[Warning] Directory {self.output_dir} already exists.")
                 ans = input("Overwrite? (y: overwrite, n: specify new directory name): ").strip().lower()
                 if ans == 'y':
-                    # Overwrite: Delete the existing directory and recreate it
                     import shutil
                     shutil.rmtree(self.output_dir)
                     print(f"{self.output_dir} deleted. Recreating...")
@@ -66,18 +69,17 @@ class RosbagToLeRobot:
                 else:
                     new_dir = input("Enter new directory name: ").strip()
                     self.output_dir = self.output_dir.parent / new_dir
-                    print(f"New output directory: {self.output_dir}")
                     continue
 
         if "teleop" not in self.dataset.meta.task_to_task_index:
             self.dataset.meta.add_task("teleop")
 
     def _get_messages(self, episode_dir):
-        """Get messages from all required topics in the rosbag."""
         messages = {
             '/joint_states': [],
             '/crane_plus_arm_controller/joint_trajectory': [],
             '/crane_plus_gripper_controller/joint_trajectory': [],
+            '/camera/image_raw': [],
         }
         with Reader(episode_dir) as reader:
             connections = [x for x in reader.connections if x.topic in messages.keys()]
@@ -105,29 +107,22 @@ class RosbagToLeRobot:
         return new_values
 
     def convert(self):
-        max_frames = 0
         episode_lengths = []
-        print("\nFirst pass: calculating episode lengths...")
+        target_freq = self.target_freq or 20
+
         for episode_dir in self.episode_dirs:
             try:
                 messages = self._get_messages(episode_dir)
                 j_times = np.array([ts for _, ts in messages['/joint_states']])
                 a_times = np.array([ts for _, ts in messages['/crane_plus_arm_controller/joint_trajectory']])
                 g_times = np.array([ts for _, ts in messages['/crane_plus_gripper_controller/joint_trajectory']])
-                # Use the intersection of available times
                 start_time = max(j_times[0], a_times[0], g_times[0])
                 end_time = min(j_times[-1], a_times[-1], g_times[-1])
-                target_freq = self.target_freq or 20
                 num_frames = int((end_time - start_time) * target_freq / 1e9)
-                max_frames = max(max_frames, num_frames)
                 episode_lengths.append(num_frames)
-                print(f"Episode {episode_dir}: {num_frames} frames")
             except Exception as e:
-                print(f"Error processing episode {episode_dir}: {e}")
+                print(f"Error checking episode {episode_dir}: {e}")
                 episode_lengths.append(0)
-                continue
-
-        print(f"\nLongest episode: {max_frames} frames")
 
         for idx, episode_dir in enumerate(self.episode_dirs):
             print(f"\nProcessing episode {idx} from {episode_dir}...")
@@ -136,39 +131,51 @@ class RosbagToLeRobot:
                 joint_states = messages['/joint_states']
                 arm_cmds = messages['/crane_plus_arm_controller/joint_trajectory']
                 gripper_cmds = messages['/crane_plus_gripper_controller/joint_trajectory']
+                cam_msgs = messages['/camera/image_raw']
+
                 j_times = np.array([ts for _, ts in joint_states])
                 j_pos = np.array([msg.position for msg, _ in joint_states])
                 a_times = np.array([ts for _, ts in arm_cmds])
                 a_pos = np.array([msg.points[0].positions if msg.points else [0,0,0,0] for msg, _ in arm_cmds])
                 g_times = np.array([ts for _, ts in gripper_cmds])
                 g_pos = np.array([msg.points[0].positions[0] if (msg.points and len(msg.points[0].positions)>0) else 0.0 for msg, _ in gripper_cmds])
+
                 start_time = max(j_times[0], a_times[0], g_times[0])
                 end_time = min(j_times[-1], a_times[-1], g_times[-1])
-                target_freq = self.target_freq or 20
                 num_frames = episode_lengths[idx]
                 target_times = np.linspace(start_time, end_time, num_frames)
-                # Sample and hold for each
-                j_pos_sampled = self._sample_and_hold(j_times, j_pos, target_times)  # (num_frames, 5)
-                a_pos_sampled = self._sample_and_hold(a_times, a_pos, target_times)  # (num_frames, 4)
-                g_pos_sampled = self._sample_and_hold(g_times, g_pos, target_times)  # (num_frames,)
-                # Concatenate after sampling
-                a_pos_full = np.hstack([a_pos_sampled, g_pos_sampled.reshape(-1,1)])  # (num_frames, 5)
-                for i in range(max_frames):
-                    idx_to_use = min(i, num_frames - 1)
+
+                j_pos_sampled = self._sample_and_hold(j_times, j_pos, target_times)
+                a_pos_sampled = self._sample_and_hold(a_times, a_pos, target_times)
+                g_pos_sampled = self._sample_and_hold(g_times, g_pos, target_times)
+                a_pos_full = np.hstack([a_pos_sampled, g_pos_sampled.reshape(-1, 1)])
+
+                # 画像の最近傍サンプリングと CHW 変換
+                c_times = np.array([ts for _, ts in cam_msgs])
+                images_sampled = []
+                for t in target_times:
+                    c_idx = np.searchsorted(c_times, t, side='right') - 1
+                    c_idx = max(0, min(c_idx, len(cam_msgs) - 1))
+                    img_arr = decode_image_msg(cam_msgs[c_idx][0])
+                    images_sampled.append(img_arr.transpose(2, 0, 1))
+
+                for i in range(num_frames):
                     self.dataset.add_frame({
-                        "observation.state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
-                        "observation.environment_state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
-                        "action": torch.tensor(a_pos_full[idx_to_use], dtype=torch.float32),
+                        "observation.state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
+                        "observation.environment_state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
+                        "observation.images.cam_external": torch.from_numpy(images_sampled[i]),
+                        "action": torch.tensor(a_pos_full[i], dtype=torch.float32),
                         "task": self.task_name,
                     })
-                print(f"Saving episode {idx}...")
+
+                print(f"Saving episode {idx} ({num_frames} frames)...")
                 self.dataset.save_episode()
                 print(f"Episode {idx} saved successfully")
             except Exception as e:
                 print(f"Error processing episode {episode_dir}: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
+
         return str(self.dataset.root)
 
 def load_config_py(config_path):
@@ -178,7 +185,6 @@ def load_config_py(config_path):
     return config
 
 def main():
-    # Load parameters from conversion_config.yaml
     with open("configs/conversion_config.yaml", "r") as f:
         conv_cfg = yaml.safe_load(f)
     bag_dir = conv_cfg["bag_dir"]
@@ -191,4 +197,4 @@ def main():
     print(f"Dataset saved to: {output_path}")
 
 if __name__ == '__main__':
-    main() 
+    main()

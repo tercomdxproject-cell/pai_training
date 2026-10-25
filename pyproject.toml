@@ -1,6 +1,6 @@
 [project]
 authors = [{name = "Tatsuya Kamijo", email = "tatsukamijo@icloud.com"}]
-dependencies = []
+dependencies = ["wandb>=0.22"]
 name = "pai_training"
 requires-python = ">= 3.10"
 version = "0.1.0"
@@ -11,25 +11,27 @@ requires = ["hatchling"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64", "linux-aarch64"]
+platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
 python = "3.10.*"
 ffmpeg = "6.1.1.*"
 rosbags = ">=0.10.10,<0.11"
-matplotlib = ">=3.10.3,<4"
+matplotlib = "*"
 
 [tool.pixi.system-requirements]
 libc = { family = "glibc", version = "2.31" }
 
 [tool.pixi.pypi-dependencies]
 pai_training = { path = ".", editable = true }
-lerobot = { path = "lerobot", editable = true, extras = ["pi0", "test", "pusht"] }
+lerobot = { path = "lerobot", editable = true }
 draccus = "==0.10.0"
 pymunk = "==6.6.0"
+torch = { version = "==2.6.0+cu124", index = "https://download.pytorch.org/whl/cu124" }
+torchvision = { version = "==0.21.0+cu124", index = "https://download.pytorch.org/whl/cu124" }
 
 [tool.pixi.activation.env]
-LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+LD_LIBRARY_PATH = "CONDAPREFIX/lib:LD_LIBRARY_PATH"
 PYTHONNOUSERSITE = "1"
 
 [tool.pixi.tasks]
@@ -37,4 +39,5 @@ convert = { cmd = "python scripts/rosbag2lerobot.py" }
 train = { cmd = "python scripts/train.py" }
 debug-policy = { cmd = "python scripts/debug_policy.py" }
 infer = { cmd = "python scripts/infer.py" }
+
 

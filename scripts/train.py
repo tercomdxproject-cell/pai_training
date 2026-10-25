@@ -1,32 +1,9 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # Copyright 2024 Tatsuya Kamijo. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Author: Tatsuya Kamijo (based on HuggingFace LeRobot lerobot/examples/3_train_policy.py)
 
 """
 Train ACT (Action Chunking with Transformer) policy on the collected dataset.
-
-This script trains an ACT policy using configuration parameters specified in:
-    - configs/train_config.yaml: Training hyperparameters like batch size, learning rate, etc.
-    - configs/crane_features.py: Dataset and feature configuration
-
-Usage:
-    pixi run train
-
 """
-
 
 from pathlib import Path
 import importlib.util
@@ -52,7 +29,7 @@ def load_train_config(yaml_path: Path):
 # =====================
 # Load parameters from YAML
 # =====================
-train_cfg = load_train_config("configs/train_config.yaml")
+train_cfg = load_train_config(Path("configs/train_config.yaml"))
 DATASET_ROOT = Path(train_cfg["dataset_root"])
 REPO_ID = train_cfg["repo_id"]
 OUTPUT_DIRECTORY = Path(train_cfg["output_directory"])
@@ -69,7 +46,6 @@ DELTA_TIMESTAMPS = train_cfg["delta_timestamps"]
 # =====================
 
 def main():
-    # Create a directory to store the training checkpoint.
     OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     config = load_config_py(CONFIG_PATH)
@@ -77,7 +53,7 @@ def main():
 
     wandb.init(project="pai_crane_gazebo", config={
         "repo_id": REPO_ID,
-        "dataset_root": DATASET_ROOT,
+        "dataset_root": str(DATASET_ROOT),
         "training_steps": TRAINING_STEPS,
         "batch_size": BATCH_SIZE,
         "chunk_size": CHUNK_SIZE,
@@ -103,7 +79,13 @@ def main():
     policy.to(DEVICE)
 
     # Instantiate the dataset
-    dataset = LeRobotDataset(REPO_ID, root=DATASET_ROOT, delta_timestamps=DELTA_TIMESTAMPS)
+    # 修正後:
+    dataset = LeRobotDataset(
+        REPO_ID,
+        root=DATASET_ROOT,
+        delta_timestamps=DELTA_TIMESTAMPS,
+        video_backend="pyav",
+    )
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE)
     dataloader = torch.utils.data.DataLoader(
@@ -111,7 +93,7 @@ def main():
         num_workers=NUM_WORKERS,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        pin_memory=False,
+        pin_memory=(DEVICE.type == "cuda"),
         drop_last=True,
     )
 
@@ -120,14 +102,22 @@ def main():
     while not done:
         for batch in dataloader:
             batch = {k: (v.to(DEVICE) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-            # Remove the sequence_length dimension to adapt to the ACT model implementation
-            batch["observation.state"] = batch["observation.state"][:, -1, :]  # (B, D)
-            batch["observation.environment_state"] = batch["observation.environment_state"][:, -1, :]  # (B, D)
-            # action is left as is
+            # Remove sequence length dimension for ACT inputs
+            batch["observation.state"] = batch["observation.state"][:, -1, :]
+            batch["observation.environment_state"] = batch["observation.environment_state"][:, -1, :]
+
+            # 画像テンソルのシーケンス次元 (B, 1, C, H, W) -> (B, C, H, W) を整形し、RGBA(4ch)ならRGB(3ch)へスライス
+            if "observation.images.cam_external" in batch:
+                img = batch["observation.images.cam_external"][:, -1, :]
+                if img.shape[1] == 4:
+                    img = img[:, :3, :, :]
+                batch["observation.images.cam_external"] = img
+
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+
 
             if step % LOG_FREQ == 0:
                 print(f"step: {step} loss: {loss.item():.3f}")
